@@ -1,0 +1,115 @@
+// Pandyan's order automation (Google Apps Script)
+// When a customer confirms an order on your website, this script:
+//   1. adds the order to this Google Sheet (tab "Orders")
+//   2. emails you the order WITH an Excel file of the products the customer chose
+//   3. emails the customer a confirmation with the same Excel file (if they gave an email)
+//   4. sends you a WhatsApp message (optional, needs the free CallMeBot key below)
+
+const OWNER_EMAIL = "diwali.crackers2026@gmail.com";
+const SHOP_NAME = "Pandyan's";
+const CALLMEBOT_PHONE = "918056046962"; // your WhatsApp number (91 + number)
+const CALLMEBOT_KEY = "";               // paste your CallMeBot API key here, or leave empty to skip WhatsApp
+
+function doPost(e) {
+  try {
+    const order = clean_(JSON.parse(e.postData.contents));
+    logOrder_(order);
+    const xlsx = makeExcel_(order);
+    sendMails_(order, xlsx);
+    sendWhatsApp_(order);
+    return ContentService.createTextOutput("ok");
+  } catch (err) {
+    GmailApp.sendEmail(OWNER_EMAIL, SHOP_NAME + " order error", String(err) + "\n\n" + (e && e.postData ? e.postData.contents : ""));
+    return ContentService.createTextOutput("error");
+  }
+}
+
+// Run this once from the editor to give the script permission.
+function authorize() {
+  SpreadsheetApp.getActiveSpreadsheet();
+  DriveApp.getRootFolder();
+  GmailApp.getInboxUnreadCount();
+  UrlFetchApp.fetch("https://www.google.com");
+}
+
+function s_(v, n) {
+  v = String(v == null ? "" : v).slice(0, n || 200);
+  return /^[=+\-@]/.test(v) ? "'" + v : v; // stops spreadsheet formula injection
+}
+
+function clean_(o) {
+  const items = (Array.isArray(o.items) ? o.items : []).slice(0, 300).map(function (i) {
+    const price = Number(i.price) || 0, qty = Math.max(0, Math.floor(Number(i.qty) || 0));
+    return { no: s_(i.no, 10), name: s_(i.name, 80), per: s_(i.per, 20), price: price, qty: qty, amount: price * qty };
+  }).filter(function (i) { return i.qty > 0; });
+  let total = 0; items.forEach(function (i) { total += i.amount; });
+  return {
+    id: s_(o.orderId, 20), name: s_(o.name, 80), phone: s_(o.phone, 15), email: s_(o.email, 100),
+    address: s_(o.address, 300), city: s_(o.city, 60), pin: s_(o.pin, 10), note: s_(o.note, 200),
+    txn: s_(o.txn, 60), items: items, total: total
+  };
+}
+
+function logOrder_(o) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName("Orders");
+  if (!sh) {
+    sh = ss.insertSheet("Orders");
+    sh.appendRow(["Time", "Order ID", "Name", "Mobile", "Email", "Address", "Note", "UPI transaction ID", "Total", "Products"]);
+    sh.setFrozenRows(1);
+  }
+  const prods = o.items.map(function (i) { return i.name + " x" + i.qty; }).join(", ");
+  sh.appendRow([new Date(), o.id, o.name, o.phone, o.email, o.address + ", " + o.city + " - " + o.pin, o.note, o.txn, o.total, prods]);
+}
+
+function makeExcel_(o) {
+  const tmp = SpreadsheetApp.create("Order " + o.id);
+  const sh = tmp.getSheets()[0];
+  sh.setName("Order");
+  const rows = [
+    ["Order ID", o.id, "", "", "", ""], ["Name", o.name, "", "", "", ""], ["Mobile", o.phone, "", "", "", ""],
+    ["Email", o.email, "", "", "", ""], ["Address", o.address + ", " + o.city + " - " + o.pin, "", "", "", ""],
+    ["Note", o.note, "", "", "", ""], ["UPI transaction ID", o.txn, "", "", "", ""], ["", "", "", "", "", ""],
+    ["S.No.", "Product", "Per", "Price", "Quantity", "Total Price"]
+  ];
+  o.items.forEach(function (i) { rows.push([i.no, i.name, i.per, i.price, i.qty, i.amount]); });
+  rows.push(["", "", "", "", "", ""], ["", "", "", "", "Grand Total", o.total]);
+  sh.getRange(1, 1, rows.length, 6).setValues(rows);
+  sh.getRange(9, 1, 1, 6).setFontWeight("bold").setBackground("#FFE600");
+  sh.getRange(rows.length, 5, 1, 2).setFontWeight("bold");
+  sh.setColumnWidth(2, 260);
+  SpreadsheetApp.flush();
+  const res = UrlFetchApp.fetch("https://docs.google.com/spreadsheets/d/" + tmp.getId() + "/export?format=xlsx",
+    { headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() } });
+  const blob = res.getBlob().setName("Order-" + o.id + ".xlsx");
+  DriveApp.getFileById(tmp.getId()).setTrashed(true);
+  return blob;
+}
+
+function summary_(o) {
+  const lines = o.items.map(function (i) { return i.no + ". " + i.name + " (per " + i.per + ") x " + i.qty + " = Rs. " + i.amount; }).join("\n");
+  return lines + "\n\nTotal: Rs. " + o.total;
+}
+
+function sendMails_(o, xlsx) {
+  const details = "Order " + o.id + "\n\n" + summary_(o) +
+    "\n\nName: " + o.name + "\nMobile: " + o.phone + "\nEmail: " + o.email +
+    "\nAddress: " + o.address + ", " + o.city + " - " + o.pin +
+    (o.note ? "\nNote: " + o.note : "") + "\nUPI transaction ID: " + o.txn;
+  GmailApp.sendEmail(OWNER_EMAIL, "New order " + o.id + " - Rs. " + o.total, details,
+    { attachments: [xlsx], name: SHOP_NAME + " Orders", replyTo: o.email || OWNER_EMAIL });
+  if (o.email) {
+    GmailApp.sendEmail(o.email, "Your order " + o.id + " is received - " + SHOP_NAME,
+      "Hi " + o.name + ",\n\nThank you for your order. We will confirm it on WhatsApp after checking your payment.\n\n" + details +
+      "\n\nYour order Excel is attached.\n\n" + SHOP_NAME,
+      { attachments: [xlsx], name: SHOP_NAME, replyTo: OWNER_EMAIL });
+  }
+}
+
+function sendWhatsApp_(o) {
+  if (!CALLMEBOT_KEY) return;
+  const msg = "New order " + o.id + " - Rs. " + o.total + "\n" + o.name + " " + o.phone + "\n" +
+    o.items.length + " products. Full list + Excel are in your email.\nUPI txn: " + o.txn;
+  UrlFetchApp.fetch("https://api.callmebot.com/whatsapp.php?phone=" + CALLMEBOT_PHONE +
+    "&text=" + encodeURIComponent(msg) + "&apikey=" + CALLMEBOT_KEY, { muteHttpExceptions: true });
+}
